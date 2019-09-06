@@ -5,7 +5,7 @@ const fs = require('fs');
 const http = require('http');
 const url = require('url');
 const net = require('net');
-
+const path = require('path');
 const defaultEncoding = 'utf8'; //presumed default encoding of torrent file
 const peerId = '3F6601FEE1E850AEBDCE';
 const PEER_TIME_OUT = 60*2000;
@@ -40,18 +40,6 @@ function getPiecesHash(piecesStr, encoding){
         hashArray.push(buf1.toString('hex',s,s+20));
     }
     return hashArray; 
-}
-
-function makeReadable(bdict){
-    for(let p of ['announce', 'created by', 'comment']){
-        if(bdict[p]){
-            bdict[p] = bdict[p].toString(defaultEncoding);
-        }
-    }
-    if(bdict.info && bdict.info.name){
-        bdict.info.name = bdict.info.name.toString(defaultEncoding);
-    }
-    return bdict
 }
 
 function parseLong(trackerRes){
@@ -91,7 +79,6 @@ function httpRequest(url, callback){
             rawData.push(chunk); 
         });
         res.on('end', () => {
-            console.log('okay!');
             let charset = contentType.match(/charset=(?<charset>.+)/);
             if(charset){
                 charset = charset.groups.charset;
@@ -166,21 +153,61 @@ class Torrent{
         .then((data)=>{
 
             this.bdict = bencode.decode(data);
-            this.bdict = makeReadable(this.bdict);
-
+            if(this.bdict.encoding){
+                this.encoding = this.bdict.encoding.toString();
+            }else{
+                this.encoding = defaultEncoding;
+            }
             let infoVal = getInfoSha1(bencode.encode(this.bdict.info));
+            this.bdict = this.makeReadable(this.bdict);
             this.bdict.infoChkSum = escapeBinary(infoVal);
             this.bdict.info.piecesChkSum = (getPiecesHash(this.bdict.info.pieces, this.bdict.encoding));
-            
+            this.createBitField();
             let trackerUrl = new url.URL(this.bdict.announce);
             
-            //scrapeTracker(trackerUrl, bdict, bdict.infoChkSum);
-            //talkTracker(trackerUrl, bdict);
-            //handShake(infoVal);
+            //this.scrapeTracker(trackerUrl, this.bdict, this.bdict.infoChkSum);
+            //this.talkTracker(trackerUrl, this.bdict);
+            this.handShake(infoVal);
         })
         .catch((error)=>{
             console.log(error);
         });
+    }
+    
+    createBitField(){
+        let totalSize = 0;
+        if(this.bdict.info.files){
+            for(let f of this.bdict.info.files){
+                totalSize += f.length;
+            }
+        }else{
+            totalSize = this.bdict.info.length;
+        }
+
+        let numPieces = Math.ceil(totalSize / this.bdict.info['piece length']);
+        this.lastPieceSize = totalSize % this.bdict.info['piece length'];
+        this.bitfield = Buffer.alloc(Math.ceil(numPieces / 8)).fill(0);
+        this.totalSize = totalSize;
+    }
+
+    makeReadable(bdict){
+        for(let p of ['announce', 'created by', 'comment']){
+            if(bdict[p]){
+                bdict[p] = bdict[p].toString(this.encoding);
+            }
+        }
+        if(bdict.info && bdict.info.name){
+            bdict.info.name = bdict.info.name.toString(this.encoding);
+        }
+        if(bdict.info && bdict.info.files){
+            let files = bdict.info.files;
+            for(let f of files){
+                let p = [];
+                p = f.path.map(x => x.toString(this.encoding));
+                f.path = p.join(path.sep);
+            }
+        }
+        return bdict
     }
 
     talkTracker(trackerUrl, bdict){
@@ -201,6 +228,9 @@ class Torrent{
         httpRequest(trackerUrlFixed, function(rawData){
             try {
                 let j = bencode.decode(Buffer.concat(rawData));
+                if(j['failure reason']){
+                    throw new Error(j['failure reason'].toString());
+                }
                 if(checkReturnType(j)){
                     console.log(prettyFormat(parseLong(j)));
                 }
@@ -258,15 +288,15 @@ class Torrent{
         let port = 6881;
         let raw = Buffer.alloc(0);
         let state = HANDSHAKE;
-        let startTime = ;
-        let lastKeepAlive = ;
+        let startTime;
+        let lastKeepAlive;
         let pidExpected = Buffer.from([45,66,84,55,97,53,83,45,0,177,224,237,201,111,150,222,52,141,47,45]);
         let pstrlen;
         let pstr;
         let ih;
         let peerid;
         let cl;
-        let bitfield;
+        let peerBitField;
         
         let amChoking = true;
         let amUninterested = true;
@@ -275,9 +305,9 @@ class Torrent{
     
         let peerRequests = [];
     
-        const client = net.createConnection({port: port, host:host, timeout:PEER_TIME_OUT}, () => {
+        const client = this.client = net.createConnection({port: port, host:host, timeout:PEER_TIME_OUT}, () => {
             console.log(`connected to ${host}:${port}`);
-            client.write(handShakeMsg(infoHash, peerId));
+            client.write(this.handShakeMsg(infoHash, peerId));
         });
         client.on('data', (data) => {
             raw = Buffer.concat([raw, data]);   
@@ -300,16 +330,15 @@ class Torrent{
                         raw = raw.slice(pos);
     
                         if(pstr.toString() !== "BitTorrent protocol"){
-                            let out = pstr.toString();
-                            console.error(`Unknown protocol: ${out}`)
-                            client.end();
+                            throw new Error(pstr.toString());
                         }
-    
-                        if(peerid.equals(pidExpected) && ih.equals(infoHash)){
+                        
+                        //disabled for testing, restore later
+                        //if(peerid.equals(pidExpected) && ih.equals(infoHash)){
+                        if(ih.equals(infoHash)){
                             state = READ_CMD_LEN;
                         }else{
-                            console.error("peerid or infohash did not match with what was provided");
-                            client.end();
+                            throw new Error("peerid or infohash did not match with what was provided");
                         }
                     }else{
                         return;
@@ -342,7 +371,7 @@ class Torrent{
                     if(raw.byteLength >= cl){
                         state = raw[0];
                         raw = raw.slice(1);
-                        cl-=1; //payload length 
+                        cl-=1; //now set to payload length 
                     }
                     else{
                         return; 
@@ -350,16 +379,21 @@ class Torrent{
                     break;
     
                 case BIT_FIELD: //Bitfield
-                    bitfield = raw.slice(0,cl);
+                    peerBitField = raw.slice(0,cl);
+                    if(peerBitField.length !== this.bitfield.length){
+                        throw new Error("Peer sent invalid bitfield.");
+                    }
                     raw = raw.slice(cl);
+                    
+                    this.sendBitField();
+                    //this.requestPiece();
                     state = READ_CMD_LEN;
-                    //request piece here
                     break;
     
                 case HAVE: //Have message 
-                    index = parseInt(raw.slice(0,cl).toString('hex'), 16);
+                    let index = parseInt(raw.slice(0,cl).toString('hex'), 16);
                     raw = raw.slice(cl);
-                    bitfield = updateBitField(index, bitfield);
+                    this.updateBitField(index);
                     state = READ_CMD_LEN;
                     break;
                 
@@ -413,10 +447,8 @@ class Torrent{
                 
             }
             }
-            
-            function requestPiece(){
-    
-            }
+          
+
         });
         client.on('end', () => {
             console.log('disconnected from server');
@@ -425,12 +457,29 @@ class Torrent{
             console.log('socket timeout');
             client.end();
         });
+        client.on('error', (e) => {
+            console.error(e);
+        })
     }  
 
-    updateBitField(index, bitfield){
-        byte_i = Math.floor(index / 8);
-        bit_i = index % 8;
-        bitfield[byte_i] |= (1 << 7) >>> bit_i;
-        return bitfield;
+    sendBitField(){
+        let msg = Buffer.alloc(this.bitfield.length + 5); // 5 = 4 bytes for length + 1 byte for id
+        msg.writeInt32BE(1+this.bitfield.length);
+        msg[4] = BIT_FIELD;
+        this.bitfield.copy(msg,5);
+        this.client.write(msg);
+    }
+    
+    requestPiece(){
+        throw new Error("Not implemented");
+    }
+
+    updateBitField(index){
+        let byte_i = Math.floor(index / 8);
+        let bit_i = index % 8;
+        this.bitfield[byte_i] |= (1 << 7) >>> bit_i;
     }
 }
+
+t = new Torrent('Richie Hayward - 1991-11-11 Club Loonies, Nijmegen, Holland [TTD].torrent');
+t.readFile();
