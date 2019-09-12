@@ -6,6 +6,7 @@ const http = require('http');
 const url = require('url');
 const net = require('net');
 const path = require('path');
+const bitwise = require('bitwise');
 const defaultEncoding = 'utf8'; //presumed default encoding of torrent file
 const peerId = '3F6601FEE1E850AEBDCE';
 const PEER_TIME_OUT = 60*2000;
@@ -25,6 +26,8 @@ const WAITING_ON_DATA = 11;
 const READ_CMD_LEN = 12;
 const READ_CMD_ID = 13;
 
+const torrentBitFields = new Map();
+const dlBitFields = new Map();
 
 function getInfoSha1(buf){
     let hash = crypto.createHash('sha1');
@@ -144,6 +147,8 @@ function escapeBinary(buffer){
 class Torrent{
     constructor(filename){
         this.filename = filename;
+        this.blockOffset = 0; 
+        this.blockReqLen = Math.pow(2,14);
     }
 
     readFile(){
@@ -175,6 +180,9 @@ class Torrent{
     }
     
     createBitField(){
+        //bitfield already created for this torrent. state kept globally.
+        if(torrentBitFields[this.filename]) return;
+
         let totalSize = 0;
         if(this.bdict.info.files){
             for(let f of this.bdict.info.files){
@@ -186,8 +194,9 @@ class Torrent{
 
         let numPieces = Math.ceil(totalSize / this.bdict.info['piece length']);
         this.lastPieceSize = totalSize % this.bdict.info['piece length'];
-        this.bitfield = Buffer.alloc(Math.ceil(numPieces / 8)).fill(0);
         this.totalSize = totalSize;
+        torrentBitFields[this.filename] = Buffer.alloc(Math.ceil(numPieces / 8)).fill(0);
+        dlBitFields[this.filename] = Buffer.from(torrentBitFields[this.filename]);
     }
 
     makeReadable(bdict){
@@ -207,7 +216,7 @@ class Torrent{
                 f.path = p.join(path.sep);
             }
         }
-        return bdict
+        return bdict;
     }
 
     talkTracker(trackerUrl, bdict){
@@ -380,13 +389,14 @@ class Torrent{
     
                 case BIT_FIELD: //Bitfield
                     peerBitField = raw.slice(0,cl);
-                    if(peerBitField.length !== this.bitfield.length){
+                    if(peerBitField.length !== torrentBitFields[this.filename]){
                         throw new Error("Peer sent invalid bitfield.");
                     }
                     raw = raw.slice(cl);
                     
                     this.sendBitField();
-                    //this.requestPiece();
+                    this.currentBlock = this.nextBlock();
+                    this.requestPiece();
                     state = READ_CMD_LEN;
                     break;
     
@@ -463,21 +473,51 @@ class Torrent{
     }  
 
     sendBitField(){
-        let msg = Buffer.alloc(this.bitfield.length + 5); // 5 = 4 bytes for length + 1 byte for id
-        msg.writeInt32BE(1+this.bitfield.length);
+        let bitfield = torrentBitFields[this.filename];
+        let msg = Buffer.alloc(bitfield.length + 5); // 5 = 4 bytes for length + 1 byte for id
+        msg.writeInt32BE(1+bitfield.length);
         msg[4] = BIT_FIELD;
-        this.bitfield.copy(msg,5);
+        bitfield.copy(msg,5); 
         this.client.write(msg);
     }
     
+    //TODO: Set on time so if piece never comes we can retrigger request.
     requestPiece(){
-        throw new Error("Not implemented");
+        //request: <len=0013><id=6><index><begin><length>
+        //find an available block or use existing we are currently working with
+        //request block using stored index and offset
+
+        let msg = Buffer.alloc(13);
+        msg[0] = REQUEST;
+        msg.writeInt32BE(this.currentBlock, 1);
+        msg.writeInt32BE(this.blockOffset, 5);
+        msg.writeInt32BE(this.blockReqLen, 9);
+        this.client.write(msg);
+
+    }
+
+    nextBlock(){
+        //when df has an index which is 1 then bf _always_ has same index zero
+        let bf = torrentBitFields[this.filename];
+        let df = dlBitFields[this.filename];
+        let interestedBlocks = bitwise.buffer.and(bitwise.buffer.not(bf), this.peerBitField);
+        let available = bitwise.buffer.xor(interestedBlocks, df) 
+        for(let bi=0; bi<available.byteLength; bi++){
+            let byte = available[bi];
+            for(let i=0; i<8; i++){
+                if(bitwise.integer.getBit(byte, i)){
+                    bitwise.integer.setBit(df[bi], i); // lock bit
+                    return i;
+                }
+            }
+        }
     }
 
     updateBitField(index){
         let byte_i = Math.floor(index / 8);
         let bit_i = index % 8;
-        this.bitfield[byte_i] |= (1 << 7) >>> bit_i;
+        let bitfield = torrentBitFields[this.filename];
+        bitfield[byte_i] |= (1 << 7) >>> bit_i;
     }
 }
 
