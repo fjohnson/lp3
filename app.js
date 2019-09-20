@@ -149,6 +149,7 @@ class Torrent{
         this.filename = filename;
         this.blockOffset = 0; 
         this.blockReqLen = Math.pow(2,14);
+        this.readFile(filename);
     }
 
     readFile(){
@@ -168,11 +169,12 @@ class Torrent{
             this.bdict.infoChkSum = escapeBinary(infoVal);
             this.bdict.info.piecesChkSum = (getPiecesHash(this.bdict.info.pieces, this.bdict.encoding));
             this.createBitField();
+            this.generateFileNamePieceMap();
             let trackerUrl = new url.URL(this.bdict.announce);
             
             //this.scrapeTracker(trackerUrl, this.bdict, this.bdict.infoChkSum);
             //this.talkTracker(trackerUrl, this.bdict);
-            this.handShake(infoVal);
+            //this.handShake(infoVal);
         })
         .catch((error)=>{
             console.log(error);
@@ -194,6 +196,9 @@ class Torrent{
 
         let numPieces = Math.ceil(totalSize / this.bdict.info['piece length']);
         this.lastPieceSize = totalSize % this.bdict.info['piece length'];
+        if(this.lastPieceSize === 0){
+            this.lastPieceSize = this.bdict.info['piece length'];
+        }
         this.totalSize = totalSize;
         this.numPieces = numPieces;
         torrentBitFields[this.filename] = Buffer.alloc(Math.ceil(numPieces / 8)).fill(0);
@@ -201,9 +206,9 @@ class Torrent{
     }
 
     generateFileNamePieceMap(){
-        let pm = new Map(this.numPieces);
+        let pm = new Map();
         let files;
-        let plen = this.bdict.info['pieces length'];
+        let plen = this.bdict.info['piece length'];
         if(this.bdict.info.files){
             files = this.bdict.info.files;
         }else{
@@ -216,7 +221,6 @@ class Torrent{
         let bytesRemaining = 0;
         let pieceBytesRemaining = 0;
         let offset = 0;
-        let len = 0;
         let record;
         while(i<this.numPieces){
             if(!pieceBytesRemaining){
@@ -233,25 +237,22 @@ class Torrent{
             }
             if(bytesRemaining >= pieceBytesRemaining){
                 bytesRemaining -= pieceBytesRemaining;
-                len += pieceBytesRemaining;
-                record = {name: file.path, offset: offset, len: len};
-                len = 0;
+                record = {name: file.path, offset: offset, len: pieceBytesRemaining};
                 offset += pieceBytesRemaining;
                 pieceBytesRemaining = 0;
             }
             else{
                 pieceBytesRemaining -= bytesRemaining;
-                len += bytesRemaining;
+                record = {name: file.path, offset: offset, len: bytesRemaining};
                 bytesRemaining = 0;
-                record = {name: file.path, offset: offset, len: len};
-                len = 0;
             }
-            if(pm[i-1] === undefined){
-                pm[i-1] = [record];
+            if(!pm.has(i-1)){
+                pm.set(i-1, [record]);
             }else{
-                pm[i-1].push(record);
+                pm.get(i-1).push(record);
             }
-        }     
+        }
+        this.piecemap = pm;  
     }
 
     makeReadable(bdict){
@@ -577,4 +578,4 @@ class Torrent{
 }
 
 t = new Torrent('Richie Hayward - 1991-11-11 Club Loonies, Nijmegen, Holland [TTD].torrent');
-t.readFile();
+
