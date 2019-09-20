@@ -195,8 +195,63 @@ class Torrent{
         let numPieces = Math.ceil(totalSize / this.bdict.info['piece length']);
         this.lastPieceSize = totalSize % this.bdict.info['piece length'];
         this.totalSize = totalSize;
+        this.numPieces = numPieces;
         torrentBitFields[this.filename] = Buffer.alloc(Math.ceil(numPieces / 8)).fill(0);
         dlBitFields[this.filename] = Buffer.from(torrentBitFields[this.filename]);
+    }
+
+    generateFileNamePieceMap(){
+        let pm = new Map(this.numPieces);
+        let files;
+        let plen = this.bdict.info['pieces length'];
+        if(this.bdict.info.files){
+            files = this.bdict.info.files;
+        }else{
+            files = [{path:this.bdict.info.name, length:this.bdict.info.length}];
+        }
+
+        let i = 0;
+        let k = 0;
+        let file;
+        let bytesRemaining = 0;
+        let pieceBytesRemaining = 0;
+        let offset = 0;
+        let len = 0;
+        let record;
+        while(i<this.numPieces){
+            if(!pieceBytesRemaining){
+                pieceBytesRemaining = plen;
+                if(i===this.numPieces-1){
+                    pieceBytesRemaining = this.lastPieceSize;
+                }
+                i++;
+            }
+            if(!bytesRemaining){
+                file = files[k++];
+                bytesRemaining = file.length;
+                offset = 0;
+            }
+            if(bytesRemaining >= pieceBytesRemaining){
+                bytesRemaining -= pieceBytesRemaining;
+                len += pieceBytesRemaining;
+                record = {name: file.path, offset: offset, len: len};
+                len = 0;
+                offset += pieceBytesRemaining;
+                pieceBytesRemaining = 0;
+            }
+            else{
+                pieceBytesRemaining -= bytesRemaining;
+                len += bytesRemaining;
+                bytesRemaining = 0;
+                record = {name: file.path, offset: offset, len: len};
+                len = 0;
+            }
+            if(pm[i-1] === undefined){
+                pm[i-1] = [record];
+            }else{
+                pm[i-1].push(record);
+            }
+        }     
     }
 
     makeReadable(bdict){
